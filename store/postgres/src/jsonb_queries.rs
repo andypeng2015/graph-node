@@ -6,9 +6,9 @@ use diesel::prelude::BoxableExpression;
 use diesel::query_builder::{AstPass, Query, QueryFragment, QueryId};
 use diesel::query_dsl::RunQueryDsl;
 use diesel::result::QueryResult;
-use diesel::sql_types::{Array, Bool, Jsonb, Text};
+use diesel::sql_types::{Array, Bool, Jsonb, Nullable, Text};
 use graph::prelude::{
-    EntityCollection, EntityFilter, EntityLink, EntityOrder, EntityRange, EntityWindow,
+    EntityCollection, EntityFilter, EntityLink, EntityOrder, EntityRange, EntityWindow, ParentLink,
     QueryExecutionError, ValueType, WindowAttribute,
 };
 
@@ -135,97 +135,6 @@ impl<'a> FilterQuery<'a> {
         }
     }
 
-    fn from_window_clause(&self, window: &EntityWindow, out: &mut AstPass<Pg>) -> QueryResult<()> {
-        match &window.link {
-            EntityLink::Direct(attribute) => {
-                match attribute {
-                    WindowAttribute::List(name) => {
-                        out.push_sql(" join lateral jsonb_array_elements(data->");
-                        out.push_bind_param::<Text, _>(name)?;
-                        out.push_sql("->'data') parent on parent->>'data' = any(");
-                        out.push_bind_param::<Array<Text>, _>(&window.ids)?;
-                        out.push_sql(")");
-                    }
-                    WindowAttribute::Scalar(_) => { /* handled in window_filter */ }
-                }
-            }
-            EntityLink::Parent(parent) => {
-                match &parent.child_field {
-                    WindowAttribute::Scalar(name) => {
-                        // inner join {table} p
-                        //   on (p.entity = '{object}'
-                        //       and c.id = p.data->{name}->>'data'
-                        out.push_sql(" inner join ");
-                        self.table.walk_ast(out.reborrow())?;
-                        out.push_sql(" p on (p.entity = '");
-                        out.push_sql(&parent.parent_type);
-                        out.push_sql("' and ");
-                        out.push_sql("c.id = p.data->");
-                        out.push_bind_param::<Text, _>(name)?;
-                        out.push_sql("->>'data'");
-                    }
-                    WindowAttribute::List(name) => {
-                        // p.data->name->'data' is an array where each entry
-                        // is a data/type pair. We dissolve that into a table
-                        // with only the 'data' values from each array entry
-                        //
-                        // inner join ({table} p
-                        //             join lateral jsonb_array_elements(p.data->{name}->'data') ary(elt) on true) p
-                        //   on (p.entity = '{object}'
-                        //       and c.id = p.elt->>'data'
-                        out.push_sql(" inner join (");
-                        self.table.walk_ast(out.reborrow())?;
-                        out.push_sql(" p join lateral jsonb_array_elements(p.data->");
-                        out.push_bind_param::<Text, _>(name)?;
-                        out.push_sql("->'data') ary(elt) on true) p on (p.entity = '");
-                        out.push_sql(&parent.parent_type);
-                        out.push_sql("' and c.id = p.elt->>'data'");
-                    }
-                }
-                out.push_sql(" and p.id = any(");
-                out.push_bind_param::<Array<Text>, _>(&window.ids)?;
-                out.push_sql("))");
-            }
-        }
-        Ok(())
-    }
-
-    fn parent_id(&self, window: &EntityWindow, out: &mut AstPass<Pg>) -> QueryResult<()> {
-        match &window.link {
-            EntityLink::Direct(attribute) => match attribute {
-                WindowAttribute::Scalar(name) => {
-                    out.push_sql("c.data->");
-                    out.push_bind_param::<Text, _>(&name)?;
-                    out.push_sql("->>'data' as g$parent_id");
-                }
-                WindowAttribute::List(_) => out.push_sql("parent->>'data' as g$parent_id"),
-            },
-            EntityLink::Parent(_) => {
-                out.push_sql("p.id as g$parent_id");
-            }
-        }
-        Ok(())
-    }
-
-    fn window_filter(&self, window: &EntityWindow, out: &mut AstPass<Pg>) -> QueryResult<()> {
-        match &window.link {
-            EntityLink::Direct(attribute) => {
-                match attribute {
-                    WindowAttribute::List(_) => { /* handled in from_window_clause */ }
-                    WindowAttribute::Scalar(name) => {
-                        out.push_sql("\n   and c.data->");
-                        out.push_bind_param::<Text, _>(name)?;
-                        out.push_sql("->>'data' = any(");
-                        out.push_bind_param::<Array<Text>, _>(&window.ids)?;
-                        out.push_sql(")");
-                    }
-                }
-            }
-            EntityLink::Parent(_) => { /* handled in from_window_clause */ }
-        }
-        Ok(())
-    }
-
     /// Generate the query when there is no window. This produces
     ///
     ///   select data, entity
@@ -251,6 +160,80 @@ impl<'a> FilterQuery<'a> {
         Ok(())
     }
 
+    fn expand_parents(&self, window: &EntityWindow, out: &mut AstPass<Pg>) -> QueryResult<()> {
+        match &window.link {
+            EntityLink::Direct(_) => {
+                // Type A and B
+                // (select * from unnest($parent_ids)) as p(id)
+                out.push_sql("(select * from unnest(");
+                out.push_bind_param::<Array<Text>, _>(&window.ids)?;
+                out.push_sql(")) as p(id)");
+            }
+            EntityLink::Parent(ParentLink::List(child_ids)) => {
+                // Type C
+                // child_ids is a Vec<Vec<String>>; Postgres will only
+                // accept that if all Vec<String> are the same length. We
+                // therefore pad shorter ones with None, which become
+                // nulls in the database
+                let maxlen = child_ids.iter().map(|ids| ids.len()).max().unwrap_or(0);
+                let child_ids = child_ids
+                    .into_iter()
+                    .map(|ids| {
+                        let mut ids: Vec<_> = ids.into_iter().map(Some).collect();
+                        ids.resize_with(maxlen, || None);
+                        ids
+                    })
+                    .collect::<Vec<_>>();
+
+                // (select * from unnest($parent_ids, $child_id_matrix)) as p(id, child_ids)
+                out.push_sql("(select * from unnest(");
+                out.push_bind_param::<Array<Text>, _>(&window.ids)?;
+                out.push_sql(", ");
+                out.push_bind_param::<Array<Array<Nullable<Text>>>, _>(&child_ids)?;
+                out.push_sql(") as p(id, child_ids)");
+            }
+            EntityLink::Parent(ParentLink::Scalar(child_ids)) => {
+                // Type D
+                // (select * from unnest($parent_ids, $child_ids)) as p(id, child_id)
+                out.push_sql("(select * from unnest(");
+                out.push_bind_param::<Array<Text>, _>(&window.ids)?;
+                out.push_sql(",");
+                out.push_bind_param::<Array<Text>, _>(&child_ids)?;
+                out.push_sql(")) as p(id, child_id)");
+            }
+        }
+        Ok(())
+    }
+
+    fn linked_children(&self, window: &EntityWindow, out: &mut AstPass<Pg>) -> QueryResult<()> {
+        match &window.link {
+            EntityLink::Direct(WindowAttribute::List(name)) => {
+                // Type A
+                // The `in (..)` part turns the id's stored in `name` into
+                // a list of parent ids
+                out.push_sql("p.id in (select ary->>'data' from jsonb_array_elements(c.data->");
+                out.push_bind_param::<Text, _>(name)?;
+                out.push_sql("->'data') ary)");
+            }
+            EntityLink::Direct(WindowAttribute::Scalar(name)) => {
+                // Type B
+                // p.id = c.data->{name}->>'data'
+                out.push_sql("p.id = c.data->");
+                out.push_bind_param::<Text, _>(name)?;
+                out.push_sql("->>'data'");
+            }
+            EntityLink::Parent(ParentLink::List(_)) => {
+                // Type C
+                out.push_sql("c.id = any(p.child_ids)");
+            }
+            EntityLink::Parent(ParentLink::Scalar(_)) => {
+                // Type D
+                out.push_sql("c.id = p.child_id");
+            }
+        }
+        Ok(())
+    }
+
     /// Generate the query when there is a window. Since we might have
     /// different filters for each entity type, we need to write this as
     /// a `union all` and can't just use `any({entity_types})` as in the
@@ -258,71 +241,53 @@ impl<'a> FilterQuery<'a> {
     ///
     /// The query we produce is
     ///
-    ///   select id, data, entity
-    ///     from (select id, data, entity,
-    ///                  rank() over (partition by g$parent_id order by {order}) as g$pos
-    ///              from {inner_query}) a
-    ///    where a.g$pos > {range.skip} and a.g$pos <= {range.skip} + {range.first}
-    ///    order by {order}
-    ///
-    /// And `inner_query` is
-    ///   select id, data, entity, {parent_id} as g$parent_id
-    ///     from {table}
-    ///          [join lateral jsonb_array_elements({window.attribute}) g$parent_id on g$parent_id = any({window.ids})]
-    ///    where entity = {entity_type}
-    ///      and [{window.attribute} = any({window.ids})]
-    ///      and {filter}
-    ///    union all
-    ///      ...
-    /// where we loop this over every entry in `self.window`
-    ///
-    /// The `join lateral` clause is only needed if the `window.attribute` is a list; if it is
-    /// a scalar, we use the `[{window.attribute} = any({window.ids})]` clause instead
+    ///   select id, data, entity, parent_id
+    ///     from {expand_parents}
+    ///          cross join lateral
+    ///            (select id, data, entity
+    ///               from entities c
+    ///              where {linked_children}
+    ///                and c.entity = {child_type}
+    ///                and {filter})
+    ///   union all
+    ///   .. range over all windows ..
+    ///   order by {order}
+    ///   limit {first} skip {skip}    
+    ///         
     fn query_window(&self, windows: &Vec<EntityWindow>, mut out: AstPass<Pg>) -> QueryResult<()> {
         out.unsafe_to_cache_prepared();
-        out.push_sql(
-            "select id, data || jsonb_build_object('g$parent_id', jsonb_build_object('data', g$parent_id, 'type', 'String')), entity\n  from (",
-        );
 
-        out.push_sql("select id, data, entity, g$parent_id");
-        out.push_sql(", rank() over (partition by g$parent_id");
-        self.order_by(&mut out)?;
-        out.push_sql(") as g$pos");
-        out.push_sql("\n  from (");
-        // inner_query starts here
         for (index, window) in windows.iter().enumerate() {
             if index > 0 {
                 out.push_sql("\nunion all\n");
             }
-            out.push_sql("select c.id, c.data, c.entity, ");
-            self.parent_id(window, &mut out)?;
-            out.push_sql("\n  from ");
+            // we actually put the parent_id into the entity as g$parent_id
+            out.push_sql(
+                "select c.id, \
+                c.data || jsonb_build_object('g$parent_id', \
+                          jsonb_build_object('data', p.id, \
+                                             'type', 'String'))
+                c.entity ",
+            );
+            self.expand_parents(window, &mut out)?;
+            out.push_sql(
+                " cross join lateral \
+                 (select c.id, c.data, c.entity \
+                 from ",
+            );
             self.table.walk_ast(out.reborrow())?;
             out.push_sql(" c");
-            self.from_window_clause(window, &mut out)?;
-            out.push_sql("\n where c.entity = ");
+            out.push_sql(" where ");
+            self.linked_children(window, &mut out)?;
+            out.push_sql(" and c.entity = ");
             out.push_bind_param::<Text, _>(&window.child_type)?;
-            self.window_filter(window, &mut out)?;
             if let Some(filter) = &self.filter {
-                out.push_sql("\n   and ");
+                out.push_sql(" and ");
                 filter.walk_ast(out.reborrow())?;
             }
         }
-        // back to the outer query
-        out.push_sql(") a) a\n where ");
-        if self.range.skip > 0 {
-            out.push_sql("a.g$pos > ");
-            out.push_sql(&self.range.skip.to_string());
-            if self.range.first.is_some() {
-                out.push_sql(" and ");
-            }
-        }
-        if let Some(first) = self.range.first {
-            let pos = self.range.skip + first;
-            out.push_sql("a.g$pos <= ");
-            out.push_sql(&pos.to_string());
-        }
-        out.push_sql("\n order by a.g$parent_id, a.g$pos");
+        self.order_by(&mut out)?;
+        self.limit(&mut out);
         Ok(())
     }
 }
