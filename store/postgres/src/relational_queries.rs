@@ -1011,11 +1011,7 @@ enum TableLink<'a> {
 }
 
 impl<'a> TableLink<'a> {
-    fn new(
-        layout: &'a Layout,
-        child_table: &'a Table,
-        link: EntityLink,
-    ) -> Result<Self, QueryExecutionError> {
+    fn new(child_table: &'a Table, link: EntityLink) -> Result<Self, QueryExecutionError> {
         match link {
             EntityLink::Direct(attribute) => {
                 let column = child_table.column_for_field(attribute.name())?;
@@ -1073,7 +1069,7 @@ impl<'a> FilterWindow<'a> {
         let query_filter = query_filter
             .map(|filter| QueryFilter::new(filter, table))
             .transpose()?;
-        let link = TableLink::new(layout, table, link)?;
+        let link = TableLink::new(table, link)?;
         Ok(FilterWindow {
             table,
             query_filter,
@@ -1083,8 +1079,8 @@ impl<'a> FilterWindow<'a> {
     }
 
     fn expand_parents(&self, out: &mut AstPass<Pg>) -> QueryResult<()> {
-        match self.link {
-            TableLink::Direct(column) => {
+        match &self.link {
+            TableLink::Direct(_) => {
                 // Type A and B
                 // (select * from unnest($parent_ids)) as p(id)
                 out.push_sql("(select * from unnest(");
@@ -1114,7 +1110,7 @@ impl<'a> FilterWindow<'a> {
     }
 
     fn linked_children(&self, out: &mut AstPass<Pg>) -> QueryResult<()> {
-        match self.link {
+        match &self.link {
             TableLink::Direct(column) => {
                 if column.is_list() {
                     // Type A
@@ -1129,11 +1125,11 @@ impl<'a> FilterWindow<'a> {
                     out.push_identifier(column.name.as_str())?;
                 }
             }
-            TableLink::Parent(ParentIds::List(child_ids)) => {
+            TableLink::Parent(ParentIds::List(_)) => {
                 // Type C
                 out.push_sql("c.id = any(p.child_ids)");
             }
-            TableLink::Parent(ParentIds::Scalar(child_ids)) => {
+            TableLink::Parent(ParentIds::Scalar(_)) => {
                 // Type D
                 out.push_sql("c.id = p.child_id");
             }
@@ -1141,13 +1137,7 @@ impl<'a> FilterWindow<'a> {
         Ok(())
     }
 
-    fn children(
-        &self,
-        sort_key: &SortKey,
-        range: &FilterRange,
-        block: BlockNumber,
-        out: &mut AstPass<Pg>,
-    ) -> QueryResult<()> {
+    fn children(&self, block: BlockNumber, out: &mut AstPass<Pg>) -> QueryResult<()> {
         out.push_sql("\n  from ");
         self.expand_parents(out)?;
         out.push_sql(" cross join lateral (select * from ");
@@ -1174,7 +1164,7 @@ impl<'a> FilterWindow<'a> {
     ) -> QueryResult<()> {
         out.push_sql("select c.*, p.id as g$parent_id");
         sort_key.select(&mut out)?;
-        self.children(sort_key, range, block, &mut out)?;
+        self.children(block, &mut out)?;
         sort_key.order_by(&mut out)?;
         range.walk_ast(out)
     }
@@ -1185,7 +1175,6 @@ impl<'a> FilterWindow<'a> {
     fn children_uniform(
         &self,
         sort_key: &SortKey,
-        range: &FilterRange,
         block: BlockNumber,
         out: &mut AstPass<Pg>,
     ) -> QueryResult<()> {
@@ -1193,7 +1182,7 @@ impl<'a> FilterWindow<'a> {
         out.push_sql(self.table.object.as_str());
         out.push_sql("' as entity, c.id, c.vid, p.id as g$parent_id");
         sort_key.select(out)?;
-        self.children(sort_key, range, block, out)
+        self.children(block, out)
     }
 }
 
@@ -1243,12 +1232,20 @@ impl<'a> FilterCollection<'a> {
                     .map(|window| FilterWindow::new(layout, window, filter))
                     .collect::<Result<Vec<_>, _>>()?;
                 let collection = if windows.len() == 1 {
-                    FilterCollection::SingleWindow(windows[0])
+                    let mut windows = windows;
+                    FilterCollection::SingleWindow(
+                        windows.pop().expect("we just checked there is an element"),
+                    )
                 } else {
                     use std::iter::FromIterator;
-                    let mut parent_ids: HashSet<String> =
-                        HashSet::from_iter(windows.iter().map(|window| window.ids).flatten());
-                    FilterCollection::MultiWindow(windows, vec![])
+                    let parent_ids: HashSet<String> = HashSet::from_iter(
+                        windows
+                            .iter()
+                            .map(|window| window.ids.iter().cloned())
+                            .flatten(),
+                    );
+                    let parent_ids = parent_ids.into_iter().collect();
+                    FilterCollection::MultiWindow(windows, parent_ids)
                 };
                 Ok(collection)
             }
@@ -1317,7 +1314,7 @@ pub struct FilterRange(EntityRange);
 
 impl QueryFragment<Pg> for FilterRange {
     fn walk_ast(&self, mut out: AstPass<Pg>) -> QueryResult<()> {
-        let range = self.0;
+        let range = &self.0;
         if let Some(first) = &range.first {
             out.push_sql("\n limit ");
             out.push_sql(&first.to_string());
@@ -1572,7 +1569,7 @@ impl<'a> FilterQuery<'a> {
             if i > 0 {
                 out.push_sql("\nunion all\n");
             }
-            window.children_uniform(&self.sort_key, &self.range, self.block, &mut out)?;
+            window.children_uniform(&self.sort_key, self.block, &mut out)?;
         }
         out.push_sql("\n ");
 
