@@ -9,10 +9,11 @@ use diesel::pg::{Pg, PgConnection};
 use diesel::query_builder::{AstPass, QueryFragment, QueryId};
 use diesel::query_dsl::{LoadQuery, RunQueryDsl};
 use diesel::result::QueryResult;
-use diesel::sql_types::{Array, Binary, Bool, Integer, Jsonb, Nullable, Numeric, Range, Text};
+use diesel::sql_types::{Array, Binary, Bool, Integer, Jsonb, Numeric, Range, Text};
 use diesel::Connection;
 use std::collections::{BTreeMap, HashSet};
 use std::convert::TryFrom;
+use std::iter::FromIterator;
 use std::str::FromStr;
 
 use graph::data::store::scalar;
@@ -996,10 +997,34 @@ impl<'a, Conn> RunQueryDsl<Conn> for ConflictingEntityQuery<'a> {}
 
 /// A `ParentLink` where we've made sure for the `List` variant that each
 /// `Vec<Option<String>>` has the same length
+/// Use the provided constructors to make sure this invariant holds
 #[derive(Debug, Clone)]
 enum ParentIds {
     List(Vec<Vec<Option<String>>>),
     Scalar(Vec<String>),
+}
+
+impl ParentIds {
+    fn new(link: ParentLink) -> Self {
+        match link {
+            ParentLink::Scalar(child_ids) => ParentIds::Scalar(child_ids),
+            ParentLink::List(child_ids) => {
+                // Postgres will only accept child_ids, which is a Vec<Vec<String>>
+                // if all Vec<String> are the same length. We therefore pad
+                // shorter ones with None, which become nulls in the database
+                let maxlen = child_ids.iter().map(|ids| ids.len()).max().unwrap_or(0);
+                let child_ids = child_ids
+                    .into_iter()
+                    .map(|ids| {
+                        let mut ids: Vec<_> = ids.into_iter().map(Some).collect();
+                        ids.resize_with(maxlen, || None);
+                        ids
+                    })
+                    .collect();
+                ParentIds::List(child_ids)
+            }
+        }
+    }
 }
 
 /// An `EntityLink` where we've resolved the entity type and attribute to the
@@ -1017,26 +1042,27 @@ impl<'a> TableLink<'a> {
                 let column = child_table.column_for_field(attribute.name())?;
                 Ok(TableLink::Direct(column))
             }
-            EntityLink::Parent(ParentLink::Scalar(child_ids)) => {
-                Ok(TableLink::Parent(ParentIds::Scalar(child_ids)))
-            }
-            EntityLink::Parent(ParentLink::List(child_ids)) => {
-                // child_ids is a Vec<Vec<String>>; Postgres will only
-                // accept that if all Vec<String> are the same length. We
-                // therefore pad shorter ones with None, which become
-                // nulls in the database
-                let maxlen = child_ids.iter().map(|ids| ids.len()).max().unwrap_or(0);
-                let child_ids = child_ids
-                    .into_iter()
-                    .map(|ids| {
-                        let mut ids: Vec<_> = ids.into_iter().map(Some).collect();
-                        ids.resize_with(maxlen, || None);
-                        ids
-                    })
-                    .collect();
-                Ok(TableLink::Parent(ParentIds::List(child_ids)))
-            }
+            EntityLink::Parent(parent_link) => Ok(TableLink::Parent(ParentIds::new(parent_link))),
         }
+    }
+}
+
+/// When we expand the parents for a specific query for children, we
+/// sometimes (aka interfaces) need to restrict them to a specific
+/// parent `q.id` that an outer query has already set up. We use this
+/// enum to control whether that is needed or not.
+#[derive(Copy, Clone, PartialEq)]
+enum ParentFilter {
+    Outer,
+    None,
+}
+
+impl QueryFragment<Pg> for ParentFilter {
+    fn walk_ast(&self, mut out: AstPass<Pg>) -> QueryResult<()> {
+        if &ParentFilter::Outer == self {
+            out.push_sql(" q.id = p.id and ");
+        }
+        Ok(())
     }
 }
 
@@ -1082,28 +1108,54 @@ impl<'a> FilterWindow<'a> {
         match &self.link {
             TableLink::Direct(_) => {
                 // Type A and B
-                // (select * from unnest($parent_ids)) as p(id)
-                out.push_sql("(select * from unnest(");
+                // unnest($parent_ids) as p(id)
+                out.push_sql("unnest(");
                 out.push_bind_param::<Array<Text>, _>(&self.ids)?;
-                out.push_sql(")) as p(id)");
+                out.push_sql(") as p(id)");
             }
             TableLink::Parent(ParentIds::List(child_ids)) => {
                 // Type C
-                // (select * from unnest($parent_ids, $child_id_matrix)) as p(id, child_ids)
-                out.push_sql("(select * from unnest(");
+                // unnest($parent_ids, $child_id_matrix) as p(id, child_ids)
+                out.push_sql("rows from (unnest(");
                 out.push_bind_param::<Array<Text>, _>(&self.ids)?;
-                out.push_sql(", ");
-                out.push_bind_param::<Array<Array<Nullable<Text>>>, _>(&child_ids)?;
-                out.push_sql(") as p(id, child_ids)");
+                out.push_sql("::text[]), reduce_dim(array[");
+                // Diesel does not support arrays of arrays as bind variables, nor
+                // arrays containing nulls, so we have to manually serialize
+                // the child_ids
+                for (i, ids) in child_ids.iter().enumerate() {
+                    if i > 0 {
+                        out.push_sql(", ");
+                    }
+                    out.push_sql("array[");
+                    for (j, id) in ids.iter().enumerate() {
+                        if j > 0 {
+                            out.push_sql(", ");
+                        }
+                        match id {
+                            None => out.push_sql("null"),
+                            Some(id) => {
+                                out.push_sql("'");
+                                if id.contains('\'') {
+                                    out.push_sql(&id.replace('\'', "''"));
+                                } else {
+                                    out.push_sql(&id);
+                                }
+                                out.push_sql("'");
+                            }
+                        }
+                    }
+                    out.push_sql("]");
+                }
+                out.push_sql("])) as p(id, child_ids)");
             }
             TableLink::Parent(ParentIds::Scalar(child_ids)) => {
                 // Type D
-                // (select * from unnest($parent_ids, $child_ids)) as p(id, child_id)
-                out.push_sql("(select * from unnest(");
+                // unnest($parent_ids, $child_ids) as p(id, child_id)
+                out.push_sql("unnest(");
                 out.push_bind_param::<Array<Text>, _>(&self.ids)?;
-                out.push_sql(",");
+                out.push_sql("::text[],");
                 out.push_bind_param::<Array<Text>, _>(&child_ids)?;
-                out.push_sql(")) as p(id, child_id)");
+                out.push_sql("::text[]) as p(id, child_id)");
             }
         }
         Ok(())
@@ -1137,36 +1189,36 @@ impl<'a> FilterWindow<'a> {
         Ok(())
     }
 
-    fn children(&self, block: BlockNumber, out: &mut AstPass<Pg>) -> QueryResult<()> {
+    fn children(
+        &self,
+        sort_key: Option<&SortKey>,
+        range: Option<&FilterRange>,
+        block: BlockNumber,
+        pf: ParentFilter,
+        mut out: AstPass<Pg>,
+    ) -> QueryResult<()> {
         out.push_sql("\n  from ");
-        self.expand_parents(out)?;
+        self.expand_parents(&mut out)?;
         out.push_sql(" cross join lateral (select * from ");
         out.push_sql(self.table.qualified_name.as_str());
         out.push_sql(" c where ");
         BlockRangeContainsClause::new("c.", block).walk_ast(out.reborrow())?;
         out.push_sql(" and ");
-        self.linked_children(out)?;
+        pf.walk_ast(out.reborrow())?;
+        self.linked_children(&mut out)?;
         if let Some(filter) = &self.query_filter {
             out.push_sql("\n   and ");
             filter.walk_ast(out.reborrow())?
         }
+        if let Some(sort_key) = sort_key {
+            out.push_sql(" order by ");
+            sort_key.order_by(&mut out)?;
+        }
+        if let Some(range) = range {
+            range.walk_ast(out.reborrow())?;
+        }
+        out.push_sql(") c");
         Ok(())
-    }
-
-    /// Select all children matching this window. The query returns all
-    /// the columns of `self.table` and a `g$parent_id` column
-    fn children_detailed(
-        &self,
-        sort_key: &SortKey,
-        range: &FilterRange,
-        block: BlockNumber,
-        mut out: AstPass<Pg>,
-    ) -> QueryResult<()> {
-        out.push_sql("select c.*, p.id as g$parent_id");
-        sort_key.select(&mut out)?;
-        self.children(block, &mut out)?;
-        sort_key.order_by(&mut out)?;
-        range.walk_ast(out)
     }
 
     /// Select a basic subset of columns from the child table for use in
@@ -1176,13 +1228,24 @@ impl<'a> FilterWindow<'a> {
         &self,
         sort_key: &SortKey,
         block: BlockNumber,
-        out: &mut AstPass<Pg>,
+        mut out: AstPass<Pg>,
     ) -> QueryResult<()> {
         out.push_sql("select '");
         out.push_sql(self.table.object.as_str());
         out.push_sql("' as entity, c.id, c.vid, p.id as g$parent_id");
-        sort_key.select(out)?;
-        self.children(block, out)
+        sort_key.select(&mut out)?;
+        self.children(None, None, block, ParentFilter::Outer, out)
+    }
+
+    /// Collect all the parent id's from all windows
+    fn collect_parents(windows: &Vec<FilterWindow>) -> Vec<String> {
+        let parent_ids: HashSet<String> = HashSet::from_iter(
+            windows
+                .iter()
+                .map(|window| window.ids.iter().cloned())
+                .flatten(),
+        );
+        parent_ids.into_iter().collect()
     }
 }
 
@@ -1237,14 +1300,7 @@ impl<'a> FilterCollection<'a> {
                         windows.pop().expect("we just checked there is an element"),
                     )
                 } else {
-                    use std::iter::FromIterator;
-                    let parent_ids: HashSet<String> = HashSet::from_iter(
-                        windows
-                            .iter()
-                            .map(|window| window.ids.iter().cloned())
-                            .flatten(),
-                    );
-                    let parent_ids = parent_ids.into_iter().collect();
+                    let parent_ids = FilterWindow::collect_parents(&windows);
                     FilterCollection::MultiWindow(windows, parent_ids)
                 };
                 Ok(collection)
@@ -1435,9 +1491,9 @@ impl<'a> FilterQuery<'a> {
     ///
     /// Generate a query
     ///   select '..' as entity, to_jsonb(e.*) as data
-    ///     from ({window.children_detailed(block)}) c
-    ///     order by c.g$parent_id, c.g$pos
-    ///     limit first offset skip
+    ///     from (select c.*, p.id as g$parent_id from {window.children(...)}) c
+    ///     order by c.g$parent_id, {sort_key}
+    ///     limit {first} offset {skip}
     fn query_window_one_entity(
         &self,
         window: &FilterWindow,
@@ -1445,11 +1501,17 @@ impl<'a> FilterQuery<'a> {
     ) -> QueryResult<()> {
         Self::select_entity_and_data(&window.table, &mut out);
         out.push_sql(" from (\n");
-        window.children_detailed(&self.sort_key, &self.range, self.block, out.reborrow())?;
+        out.push_sql("select c.*, p.id as g$parent_id");
+        window.children(
+            Some(&self.sort_key),
+            Some(&self.range),
+            self.block,
+            ParentFilter::None,
+            out.reborrow(),
+        )?;
         out.push_sql(") c");
-        out.push_sql("\n order by ");
-        self.sort_key.order_by(&mut out)?;
-        self.range.walk_ast(out)
+        out.push_sql("\n order by g$parent_id, ");
+        self.sort_key.order_by(&mut out)
     }
 
     /// No windowing, but multiple entity types
@@ -1541,16 +1603,13 @@ impl<'a> FilterQuery<'a> {
         //
         // with matches as (
         //     select c.*
-        //       from (select id from unnest({all_parent_ids}) as p(id))
+        //       from (select id from unnest({all_parent_ids}) as q(id)) q
         //            cross join lateral
-        //            (select *
-        //               from
-        //                 ({window.children_uniform}
-        //                  union all
-        //                  ... range over all windows ...) c
-        //              where c.parent_id = p.id
-        //              order by c.{sort_key}
-        //              limit $first skip $skip) c)
+        //            ({window.children_uniform("q")}
+        //             union all
+        //             ... range over all windows ...
+        //             order by c.{sort_key}
+        //             limit $first skip $skip) c)
         //   select m.entity, to_jsonb(c.*) as data, m.parent_id
         //     from matches m, {window.child_table} c
         //    where c.vid = m.vid and m.entity = '{window.child_type}'
@@ -1560,21 +1619,18 @@ impl<'a> FilterQuery<'a> {
 
         // Step 1: build matches CTE
         out.push_sql("with matches as (");
-        out.push_sql("select c.* from (");
-        out.push_sql("from (select id from unnest(");
+        out.push_sql("select c.* from ");
+        out.push_sql("unnest(");
         out.push_bind_param::<Array<Text>, _>(parent_ids)?;
-        out.push_sql(") as p(id))\n");
-        out.push_sql(" cross join lateral (select * from  (");
+        out.push_sql(") as q(id)\n");
+        out.push_sql(" cross join lateral (");
         for (i, window) in windows.iter().enumerate() {
             if i > 0 {
                 out.push_sql("\nunion all\n");
             }
-            window.children_uniform(&self.sort_key, self.block, &mut out)?;
+            window.children_uniform(&self.sort_key, self.block, out.reborrow())?;
         }
-        out.push_sql("\n ");
-
-        out.push_sql(") c where c.parent_id = p.id\n");
-        out.push_sql("order by ");
+        out.push_sql("\norder by ");
         self.sort_key.order_by(&mut out)?;
         self.range.walk_ast(out.reborrow())?;
         out.push_sql(") c)\n");
@@ -1596,9 +1652,8 @@ impl<'a> FilterQuery<'a> {
                 out.push_sql("\nunion all\n");
             }
             out.push_sql(
-                "select m.entity, \
-                 to_jsonb(c.*) || jsonb_build_object('g$parent_id', m.g$parent_id) as data, \
-                 m.g$parent_id, m.g$pos",
+                "select m.*, \
+                 to_jsonb(c.*) || jsonb_build_object('g$parent_id', m.g$parent_id) as data",
             );
             out.push_sql("\n  from ");
             out.push_sql(table_name.as_str());
