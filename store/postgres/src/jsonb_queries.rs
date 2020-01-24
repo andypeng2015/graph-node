@@ -6,7 +6,7 @@ use diesel::prelude::BoxableExpression;
 use diesel::query_builder::{AstPass, Query, QueryFragment, QueryId};
 use diesel::query_dsl::RunQueryDsl;
 use diesel::result::QueryResult;
-use diesel::sql_types::{Array, Bool, Jsonb, Nullable, Text};
+use diesel::sql_types::{Array, Bool, Jsonb, Text};
 use graph::prelude::{
     EntityCollection, EntityFilter, EntityLink, EntityOrder, EntityRange, EntityWindow, ParentLink,
     QueryExecutionError, ValueType, WindowAttribute,
@@ -160,46 +160,66 @@ impl<'a> FilterQuery<'a> {
         Ok(())
     }
 
+    // Produce a literal `array[array[..],..]` containing child_ids
+    fn matrix_literal(child_ids: &Vec<Vec<String>>, out: &mut AstPass<Pg>) {
+        let maxlen = child_ids.iter().map(|ids| ids.len()).max().unwrap_or(0);
+        // Diesel does not support arrays of arrays as bind variables, nor
+        // arrays containing nulls, so we have to manually serialize
+        // the child_ids
+        out.push_sql("array[");
+        for (i, ids) in child_ids.iter().enumerate() {
+            if i > 0 {
+                out.push_sql(", ");
+            }
+            out.push_sql("array[");
+            for id in ids {
+                out.push_sql("'");
+                if id.contains('\'') {
+                    out.push_sql(&id.replace('\'', "''"));
+                } else {
+                    out.push_sql(&id);
+                }
+                out.push_sql("'");
+            }
+            // Pad individual arrays with 'null' since Postgres requires that
+            // in an array of arrays all rows have the same number of entries
+            for j in 0..(maxlen - ids.len()) {
+                if j > 0 || ids.len() > 0 {
+                    out.push_sql(", ");
+                }
+                out.push_sql("null");
+            }
+            out.push_sql("]");
+        }
+        out.push_sql("]");
+    }
+
     fn expand_parents(&self, window: &EntityWindow, out: &mut AstPass<Pg>) -> QueryResult<()> {
         match &window.link {
             EntityLink::Direct(_) => {
                 // Type A and B
-                // (select * from unnest($parent_ids)) as p(id)
-                out.push_sql("(select * from unnest(");
+                // unnest($parent_ids) as p(id)
+                out.push_sql("unnest(");
                 out.push_bind_param::<Array<Text>, _>(&window.ids)?;
-                out.push_sql(")) as p(id)");
+                out.push_sql(") as p(id)");
             }
             EntityLink::Parent(ParentLink::List(child_ids)) => {
                 // Type C
-                // child_ids is a Vec<Vec<String>>; Postgres will only
-                // accept that if all Vec<String> are the same length. We
-                // therefore pad shorter ones with None, which become
-                // nulls in the database
-                let maxlen = child_ids.iter().map(|ids| ids.len()).max().unwrap_or(0);
-                let child_ids = child_ids
-                    .into_iter()
-                    .map(|ids| {
-                        let mut ids: Vec<_> = ids.into_iter().map(Some).collect();
-                        ids.resize_with(maxlen, || None);
-                        ids
-                    })
-                    .collect::<Vec<_>>();
-
-                // (select * from unnest($parent_ids, $child_id_matrix)) as p(id, child_ids)
-                out.push_sql("(select * from unnest(");
+                // rows from (unnest($parent_ids), reduce_dim($child_id_matrix)) as p(id, child_ids)
+                out.push_sql("rows from (unnest(");
                 out.push_bind_param::<Array<Text>, _>(&window.ids)?;
-                out.push_sql(", ");
-                out.push_bind_param::<Array<Array<Nullable<Text>>>, _>(&child_ids)?;
-                out.push_sql(") as p(id, child_ids)");
+                out.push_sql("::text[]), reduce_dim(array[");
+                Self::matrix_literal(child_ids, out);
+                out.push_sql(")) as p(id, child_ids)");
             }
             EntityLink::Parent(ParentLink::Scalar(child_ids)) => {
                 // Type D
-                // (select * from unnest($parent_ids, $child_ids)) as p(id, child_id)
-                out.push_sql("(select * from unnest(");
+                // unnest($parent_ids, $child_ids) as p(id, child_id)
+                out.push_sql("unnest(");
                 out.push_bind_param::<Array<Text>, _>(&window.ids)?;
                 out.push_sql(",");
                 out.push_bind_param::<Array<Text>, _>(&child_ids)?;
-                out.push_sql(")) as p(id, child_id)");
+                out.push_sql(") as p(id, child_id)");
             }
         }
         Ok(())
@@ -254,20 +274,23 @@ impl<'a> FilterQuery<'a> {
     ///   order by {order}
     ///   limit {first} skip {skip}    
     ///         
+    #[allow(unreachable_code, unused_variables)]
     fn query_window(&self, windows: &Vec<EntityWindow>, mut out: AstPass<Pg>) -> QueryResult<()> {
         out.unsafe_to_cache_prepared();
 
         for (index, window) in windows.iter().enumerate() {
+            unimplemented!(
+                "We need an outer loop over all parent ids q to correctly limit/skip by parent"
+            );
             if index > 0 {
                 out.push_sql("\nunion all\n");
             }
             // we actually put the parent_id into the entity as g$parent_id
             out.push_sql(
                 "select c.id, \
-                c.data || jsonb_build_object('g$parent_id', \
-                          jsonb_build_object('data', p.id, \
-                                             'type', 'String'))
-                c.entity ",
+                 c.data || \
+                   jsonb_build_object('g$parent_id', jsonb_build_object('data', p.id, 'type', 'String')), \
+                 c.entity from "
             );
             self.expand_parents(window, &mut out)?;
             out.push_sql(
@@ -285,6 +308,7 @@ impl<'a> FilterQuery<'a> {
                 out.push_sql(" and ");
                 filter.walk_ast(out.reborrow())?;
             }
+            out.push_sql(") c");
         }
         self.order_by(&mut out)?;
         self.limit(&mut out);
